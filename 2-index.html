@@ -115,7 +115,26 @@ async function ensureSheet() {
   spreadsheetId = localStorage.getItem('cb_sheet');
   if (spreadsheetId) {
     const r = await api(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}?fields=spreadsheetId`);
-    if (r.ok) return;
+    if (r.ok) { await ensureMeta(); await syncNames(); return; }
+    localStorage.removeItem('cb_sheet'); spreadsheetId = null;
+  }
+  const q = encodeURIComponent(`name='${CONFIG.sheetTitle}' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false`);
+  const lr = await api(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,createdTime)&orderBy=createdTime%20desc&pageSize=10`);
+  const ld = await lr.json();
+  const files = ld.files || [];
+  if (files.length) {
+    let best = files[0].id, bestRows = -1;
+    for (const f of files) {
+      try {
+        const cr = await api(`https://sheets.googleapis.com/v4/spreadsheets/${f.id}/values/${CONFIG.sheetName}!A:A`);
+        if (!cr.ok) continue;
+        const cd = await cr.json();
+        const n = (cd.values || []).length;
+        if (n > bestRows) { bestRows = n; best = f.id; }
+      } catch(e) { /* skip unreadable candidate */ }
+    }
+    spreadsheetId = best; localStorage.setItem('cb_sheet', spreadsheetId);
+    await ensureMeta(); await syncNames(); return;
   }
   const r = await api('https://sheets.googleapis.com/v4/spreadsheets', {
     method: 'POST',
@@ -127,6 +146,81 @@ async function ensureSheet() {
   await api(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${CONFIG.sheetName}!A1:G1?valueInputOption=RAW`, {
     method: 'PUT', body: JSON.stringify({ values: [HEADERS] })
   });
+  await ensureMeta(); await syncNames();
+}
+
+async function ensureMeta() {
+  const r = await api(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}?fields=sheets.properties.title`);
+  const d = await r.json();
+  const titles = (d.sheets || []).map(s => s.properties.title);
+  if (!titles.includes('meta')) {
+    await api(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}:batchUpdate`, {
+      method: 'POST', body: JSON.stringify({ requests: [{ addSheet: { properties: { title: 'meta' } } }] })
+    });
+    await api(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/meta!A1:D1?valueInputOption=RAW`, {
+      method: 'PUT', body: JSON.stringify({ values: [['kind','id','name','parent']] })
+    });
+  }
+}
+
+async function saveMeta(kind, id, name, parent) {
+  if (!spreadsheetId) return;
+  try {
+    await api(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/meta!A:D:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`, {
+      method: 'POST', body: JSON.stringify({ values: [[kind, id, name, parent || '']] })
+    });
+  } catch(e) { /* name sync is best-effort; messages still flow */ }
+}
+
+async function syncNames() {
+  const r = await api(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/meta!A2:D`);
+  if (!r.ok) return;
+  const d = await r.json();
+  const metaRows = (d.values || []).filter(v => v.length >= 3 && v[1] && v[2]);
+  const seen = {};
+  let changed = false;
+  for (const v of metaRows) seen[v[0] + ':' + v[1]] = true;
+  for (const v of metaRows) {
+    if (v[0] !== 'project') continue;
+    const id = v[1], name = v[2];
+    const p = store.projects[id];
+    if (p) { if (p.title !== name) { p.title = name; delete p.legacy; changed = true; } }
+    else { store.projects[id] = { title: name, chats: {} }; store.order.push(id); changed = true; }
+  }
+  for (const v of metaRows) {
+    if (v[0] !== 'chat') continue;
+    const id = v[1], name = v[2], parent = v[3] || '';
+    const p = store.projects[parent];
+    if (!p) continue;
+    if (!p.chats[id]) { p.chats[id] = { title: name, created: Date.now() }; changed = true; }
+    else if (p.chats[id].title !== name || p.chats[id].legacy) { p.chats[id].title = name; delete p.chats[id].legacy; changed = true; }
+  }
+  const push = [];
+  for (const [pid, p] of Object.entries(store.projects)) {
+    if (!p.legacy && !seen['project:' + pid]) push.push(['project', pid, p.title, '']);
+    for (const [cid, c] of Object.entries(p.chats)) {
+      if (!c.legacy && !seen['chat:' + cid]) push.push(['chat', cid, c.title, pid]);
+    }
+  }
+  if (push.length) {
+    try {
+      await api(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/meta!A:D:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`, {
+        method: 'POST', body: JSON.stringify({ values: push })
+      });
+    } catch(e) { /* best-effort */ }
+  }
+  if (changed) { save(); renderTree(); renderMessages(); }
+}
+
+function ensureLegacy() {
+  let changed = false;
+  for (const r of rows) {
+    if (!r.project || !r.chat) continue;
+    let p = store.projects[r.project];
+    if (!p) { p = store.projects[r.project] = { title: 'سجل سابق', chats: {}, legacy: true }; store.order.push(r.project); changed = true; }
+    if (!p.chats[r.chat]) { p.chats[r.chat] = { title: 'محادثة سابقة', created: new Date(r.ts || Date.now()).getTime(), legacy: true }; changed = true; }
+  }
+  if (changed) { save(); renderTree(); }
 }
 
 async function appendRow(direction, body, status) {
@@ -146,6 +240,7 @@ async function poll() {
     const d = await r.json();
     rows = (d.values || []).filter(v => v.length >= 6).map(v => ({ id:v[0], ts:v[1], project:v[2], chat:v[3], direction:v[4], body:v[5] }));
     $('lastSync').textContent = new Date().toLocaleTimeString('ar-EG');
+    ensureLegacy();
     renderMessages();
   } catch(e) { /* auth handler already ran */ }
 }
@@ -194,6 +289,7 @@ function newProject() {
     const pid = uid(), cid = uid();
     store.projects[pid] = { title, chats: { [cid]: { title: 'محادثة 1', created: Date.now() } } };
     store.order.unshift(pid); activeChat = cid; save(); renderTree(); renderMessages(); closeSidebar();
+    saveMeta('project', pid, title, ''); saveMeta('chat', cid, 'محادثة 1', pid);
   });
 }
 function newChat() {
@@ -204,6 +300,7 @@ function newChat() {
     const cid = uid();
     store.projects[pid].chats[cid] = { title, created: Date.now() };
     activeChat = cid; save(); renderTree(); renderMessages(); closeSidebar();
+    saveMeta('chat', cid, title, pid);
   });
 }
 async function send() {
